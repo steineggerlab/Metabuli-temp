@@ -165,22 +165,25 @@ void Classifier::startClassify(const LocalParameters &par) {
         // Get start and end positions of each read
         if (isFasta) {
             splitFASTA(sequences, queryPath_1);
-            splitFASTA(sequences, queryPath_2);
+            splitFASTA(sequences2, queryPath_2);
         } else {
             splitFASTQ(sequences, queryPath_1);
             splitFASTQ(sequences2, queryPath_2);
         }
 
+        cout << "2" << endl;
         if (sequences.size() != sequences2.size()) {
             Debug(Debug::ERROR) << "The number of reads in the two files are not equal." << "\n";
             EXIT(EXIT_FAILURE);
         }
 
+        cout << "3" << endl;
+
         // Allocate memory for query list
         numOfSeq = sequences.size();
         queryList = new Query[numOfSeq];
 
-
+        cout << "3.5" << endl;
         // Make query read splits
         size_t start = 0;
         size_t kmerCnt = 0;
@@ -196,6 +199,10 @@ void Classifier::startClassify(const LocalParameters &par) {
             totalReadLength += sequences2[i].seqLength;
         }
         queryReadSplit.emplace_back(start, numOfSeq);
+        // why do update?????????
+
+
+        cout << "4" << endl;
     }
 
     cout << "Done" << endl;
@@ -383,7 +390,7 @@ T Classifier::getQueryKmerNumber(T queryLength) {
     return (getMaxCoveredLength(queryLength) / 3 - kmerLength - spaceNum_int + 1) * 6;
 }
 
-void Classifier::fillQueryKmerBufferParallel_paired(QueryKmerBuffer &kmerBuffer,
+void Classifier::   fillQueryKmerBufferParallel_paired(QueryKmerBuffer &kmerBuffer,
                                                     MmapedData<char> &seqFile1,
                                                     MmapedData<char> &seqFile2,
                                                     vector<Sequence> &seqs,
@@ -2061,15 +2068,14 @@ void Classifier::splitFASTA(vector<Sequence> & seqSegments, const string & query
     string line;
     size_t start = 0;
     size_t end;
-    getline(fasta, line);
     size_t seqLength = 0;
+    getline(fasta, line);
     while (getline(fasta, line)) {
         if (line[0] == '>') {
             end = (size_t) fasta.tellg() - line.length() - 2;
             seqSegments.emplace_back(start, end, end - start + 1, seqLength);
             start = end + 1;
             seqLength = 0;
-
         } else {
             seqLength += line.length();
         }
