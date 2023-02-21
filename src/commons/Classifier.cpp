@@ -113,6 +113,9 @@ void Classifier::startClassify(const LocalParameters &par) {
 
     // Calculate maximum number of k-mers for each iteration.
     size_t maxNumOfKmer = 0;
+    size_t matchPerKmer = 4;
+    size_t c = (1 + matchPerKmer) * 16;
+    size_t ram_threads = ((size_t) par.ramUsage * (size_t) 1073741824) - ((size_t) 134217728 * (size_t) par.threads);
 
     // Load query file
     cout << "Indexing query file ...";
@@ -122,12 +125,17 @@ void Classifier::startClassify(const LocalParameters &par) {
     vector<Sequence> sequences;
     vector<Sequence> sequences2;
     vector<pair<size_t, size_t>> queryReadSplit;
-    Query *queryList;
+    vector<size_t> splitKmerCnt;
+    vector<Query> queryList;
+//    Query *queryList;
     size_t numOfSeq = 0;
+    size_t start = 0;
+    size_t kmerCnt = 0;
+    size_t currentKmerCnt = 0;
+    size_t seqCnt = 0;
     if (par.seqMode == 1 || par.seqMode == 3) {
         queryFile = mmapData<char>(queryPath_1.c_str());
         madvise(queryFile.data, queryFile.fileSize, MADV_SEQUENTIAL);
-        Util::touchMemory(queryFile.data, queryFile.fileSize);
 
         // Get start and end positions of each read
         if (isFasta) {
@@ -136,31 +144,24 @@ void Classifier::startClassify(const LocalParameters &par) {
             splitFASTQ(sequences, queryPath_1);
         }
 
-        // Allocate memory for query list
-        numOfSeq = sequences.size();
-        queryList = new Query[numOfSeq];
-
         // Make query read splits
-        size_t start = 0;
-        size_t kmerCnt = 0;
+        numOfSeq = sequences.size();
         for (size_t i = 0; i < numOfSeq; i++) {
-            kmerCnt += getQueryKmerNumber<size_t>(sequences[i].seqLength);
-            if (kmerCnt > maxNumOfKmer) {
+            currentKmerCnt = getQueryKmerNumber<size_t>(sequences[i].seqLength);
+            kmerCnt += currentKmerCnt;
+            seqCnt++;
+            if (c * kmerCnt + ((size_t) 200 * seqCnt) > ram_threads) {
+                splitKmerCnt.push_back(kmerCnt - currentKmerCnt);
                 queryReadSplit.emplace_back(start, i);
-                kmerCnt = 0;
+                kmerCnt = currentKmerCnt;
                 start = i;
+                seqCnt = 1;
             }
             totalReadLength += sequences[i].seqLength;
         }
         queryReadSplit.emplace_back(start, numOfSeq);
-
+        splitKmerCnt.push_back(kmerCnt);
     } else if (par.seqMode == 2) {
-        queryFile = mmapData<char>(queryPath_1.c_str());
-        queryFile2 = mmapData<char>(queryPath_2.c_str());
-        madvise(queryFile.data, queryFile.fileSize, MADV_SEQUENTIAL);
-        madvise(queryFile2.data, queryFile2.fileSize, MADV_SEQUENTIAL);
-        Util::touchMemory(queryFile.data, queryFile.fileSize);
-        Util::touchMemory(queryFile2.data, queryFile2.fileSize);
 
         // Get start and end positions of each read
         if (isFasta) {
@@ -171,146 +172,128 @@ void Classifier::startClassify(const LocalParameters &par) {
             splitFASTQ(sequences2, queryPath_2);
         }
 
-        cout << "2" << endl;
         if (sequences.size() != sequences2.size()) {
             Debug(Debug::ERROR) << "The number of reads in the two files are not equal." << "\n";
             EXIT(EXIT_FAILURE);
         }
 
-        cout << "3" << endl;
-
-        // Allocate memory for query list
         numOfSeq = sequences.size();
-        queryList = new Query[numOfSeq];
-
-        cout << "3.5" << endl;
         // Make query read splits
-        size_t start = 0;
-        size_t kmerCnt = 0;
         for (size_t i = 0; i < numOfSeq; i++) {
-            kmerCnt += getQueryKmerNumber<size_t>(sequences[i].seqLength);
-            kmerCnt += getQueryKmerNumber<size_t>(sequences2[i].seqLength);
-            if (kmerCnt > maxNumOfKmer) {
+            currentKmerCnt = getQueryKmerNumber<size_t>(sequences[i].seqLength) +
+                             getQueryKmerNumber<size_t>(sequences2[i].seqLength);
+            kmerCnt += currentKmerCnt;
+            seqCnt ++;
+            if (c * kmerCnt + ((size_t) 200 * seqCnt) > ram_threads) {
+                splitKmerCnt.push_back(kmerCnt - currentKmerCnt);
                 queryReadSplit.emplace_back(start, i);
-                kmerCnt = 0;
+                kmerCnt = currentKmerCnt;
                 start = i;
+                seqCnt = 1;
             }
-            totalReadLength += sequences[i].seqLength;
-            totalReadLength += sequences2[i].seqLength;
+            totalReadLength += sequences[i].seqLength + sequences2[i].seqLength;
         }
         queryReadSplit.emplace_back(start, numOfSeq);
-        // why do update?????????
-
-
-        cout << "4" << endl;
+        splitKmerCnt.push_back(kmerCnt);
     }
-
     cout << "Done" << endl;
     cout << "Total number of sequences: " << numOfSeq << endl;
     cout << "Total read length: " << totalReadLength <<  "nt" << endl;
 
-    // Allocate memory for buffers
-    // 1. Calculate estimated maximum RAM usage
-    size_t estimatedNumOfKmer;
-    size_t matchPerKmer = 5;
-    if(par.seqMode == 2) {
-        estimatedNumOfKmer = 2 * totalReadLength - 84 * numOfSeq;
-    }
-    else {
-        estimatedNumOfKmer = 2 * totalReadLength - 42 * numOfSeq;
-    }
-    size_t memoryForReads = 200 * numOfSeq; // 200 bytes per read
-    size_t memoryForThreads = (size_t) 128'000'000 * (size_t) par.threads; // 128 MB per thread
-    size_t memoryForQueryKmer = estimatedNumOfKmer * sizeof(QueryKmer);
-    size_t memoryForKmerMatch = estimatedNumOfKmer * sizeof(Match) * matchPerKmer;
-    size_t estimatedMaxRamUsage = memoryForReads + memoryForThreads + memoryForQueryKmer + memoryForKmerMatch;
-
-    // 2. Check if the estimated memory usage is larger than the available memory
-    size_t maxCount = 0;
-    if (estimatedMaxRamUsage / 1'000'000'000 >= (size_t) par.ramUsage ) {
-        maxCount = ((size_t) par.ramUsage * 1'000'000'000 - memoryForReads - memoryForThreads) /
-                (96 * (par.ramUsage + 32) / par.ramUsage);
-        memoryForQueryKmer = maxCount * sizeof(QueryKmer);
-        memoryForKmerMatch = maxCount * sizeof(Match) * matchPerKmer;
-    } else {
-        maxCount = estimatedNumOfKmer;
-    }
-
-    cout << memoryForReads << " " << memoryForThreads << " " << memoryForQueryKmer << " " << memoryForKmerMatch << endl;
-    cout << "TOTAL: " << memoryForReads + memoryForThreads + memoryForQueryKmer + memoryForKmerMatch << endl;
-    cout << maxCount << endl;
-
-
-    QueryKmerBuffer kmerBuffer(maxCount);
-    Buffer<Match> matchBuffer(size_t(maxCount) * matchPerKmer);
-
-    // Checker for multi-threading
-    bool *processedSeqChecker = new bool[numOfSeq];
-    fill_n(processedSeqChecker, numOfSeq, false);
-    size_t processedSeqCnt = 0;
+    QueryKmerBuffer kmerBuffer;
+    Buffer<Match> matchBuffer;
 
     size_t numOfTatalQueryKmerCnt = 0;
     size_t totalMatchCnt = 0;
+    size_t processedSeqCnt = 0;
 
-
+    ofstream readClassificationFile;
+    readClassificationFile.open(outDir + "/" + jobId + "_classifications.tsv");
 #ifdef OPENMP
     omp_set_num_threads(par.threads);
 #endif
     // Extract k-mers from query sequences and compare them to target k-mer DB
-    while (processedSeqCnt < numOfSeq) {
-        time_t beforeKmerExtraction = time(nullptr);
+    double vm, rss;
+    for (size_t splitIdx = 0; splitIdx < queryReadSplit.size(); splitIdx++) {
+        // Allocate memory for query list
+        queryList.clear();
+        queryList.resize(queryReadSplit[splitIdx].second - queryReadSplit[splitIdx].first + 1);
+        process_mem_usage(vm, rss);
+        cout << "Query list memory usage: " << endl;
+        cout << "VM: " << vm << "; RSS: " << rss << endl;
+
+        // Allocate memory for query k-mer list and match list
+        kmerBuffer.reallocateMemory(splitKmerCnt[splitIdx]);
+        matchBuffer.reallocateMemory(splitKmerCnt[splitIdx] * matchPerKmer);
+
+        process_mem_usage(vm, rss);
+        cout << "Kmer and match buffer allocated: " << endl;
+        cout << "VM: " << vm << "; RSS: " << rss << endl;
 
         // Initialize query k-mer buffer and match buffer
         kmerBuffer.startIndexOfReserve = 0;
         matchBuffer.startIndexOfReserve = 0;
 
         // Extract query k-mer
+        time_t beforeKmerExtraction = time(nullptr);
         cout << "K-mer extraction ... " << endl;
         if (par.seqMode == 1 || par.seqMode == 3) { // Single-end short-read sequence or long-read sequence
-            fillQueryKmerBufferParallel(kmerBuffer,queryFile,sequences,processedSeqChecker,processedSeqCnt,
-                                        queryList, par);
+            fillQueryKmerBufferParallel(kmerBuffer, queryFile, sequences, queryList, queryReadSplit[splitIdx], par);
         } else if (par.seqMode == 2) {
-            fillQueryKmerBufferParallel_paired(kmerBuffer,queryFile,queryFile2,sequences,sequences2,
-                                               processedSeqChecker, processedSeqCnt, queryList, numOfSeq, par);
+            fillQueryKmerBufferParallel(kmerBuffer, queryFile, queryFile2, sequences, sequences2, queryList, queryReadSplit[splitIdx], par);
         }
         numOfTatalQueryKmerCnt += kmerBuffer.startIndexOfReserve;
+
+        process_mem_usage(vm, rss);
+        cout << "Kmers extracted: " << endl;
+        cout << "VM: " << vm << "; RSS: " << rss << endl;
+
         cout << "Time spent for k-mer extraction: " << double(time(nullptr) - beforeKmerExtraction) << endl;
 
         // Sort query k-mer
         time_t beforeQueryKmerSort = time(nullptr);
+        cout << "Sorting query k-mer list ..." << endl;
         SORT_PARALLEL(kmerBuffer.buffer, kmerBuffer.buffer + kmerBuffer.startIndexOfReserve, compareForLinearSearch);
         cout << "Time spent for sorting query k-mer list: " << double(time(nullptr) - beforeQueryKmerSort) << endl;
 
         // Search matches between query and target k-mers
         linearSearchParallel(kmerBuffer.buffer, kmerBuffer.startIndexOfReserve, matchBuffer, par);
 
+        process_mem_usage(vm, rss);
+        cout << "Matches searched: " << endl;
+        cout << "VM: " << vm << "; RSS: " << rss << endl;
+
         // Sort matches
         time_t beforeSortMatches = time(nullptr);
         totalMatchCnt += matchBuffer.startIndexOfReserve;
+        cout << "Sorting Matches" << endl;
         SORT_PARALLEL(matchBuffer.buffer, matchBuffer.buffer + matchBuffer.startIndexOfReserve,
                       sortMatch(this));
         cout << "Time spent for sorting matches: " << double(time(nullptr) - beforeSortMatches) << endl;
 
         // Classify queries based on the matches
         time_t beforeAnalyze = time(nullptr);
-        fromMatchToClassification(matchBuffer.buffer, matchBuffer.startIndexOfReserve, (int) numOfSeq, queryList, par);
+
+        cout << "Analyzing matches ..." << endl;
+        fromMatchToClassification(matchBuffer.buffer, matchBuffer.startIndexOfReserve, queryList, par);
+
         cout << "Time spent for analyzing: " << double(time(nullptr) - beforeAnalyze) << endl;
+        processedSeqCnt += queryReadSplit[splitIdx].second - queryReadSplit[splitIdx].first;
         cout << "The number of processed sequences: " << processedSeqCnt << " (" << (double) processedSeqCnt / (double) numOfSeq << ")" << endl;
+        writeReadClassification(queryList,
+                                (int) (queryReadSplit[splitIdx].second - queryReadSplit[splitIdx].first),
+                                readClassificationFile);
     }
     cout << "Number of query k-mers: " << numOfTatalQueryKmerCnt << endl;
     cout << "The number of matches: " << totalMatchCnt << endl;
+    readClassificationFile.close();
 
     // Write report files
-    ofstream readClassificationFile;
-    readClassificationFile.open(outDir + "/" + jobId + "_classifications.tsv");
-    writeReadClassification(queryList, (int) numOfSeq, readClassificationFile);
-    readClassificationFile.close();
     writeReportFile(outDir + "/" + jobId + "_report.tsv", numOfSeq, taxCounts);
 
     // Memory deallocation
     free(matchBuffer.buffer);
-    delete[] queryList;
-    delete[] processedSeqChecker;
+
     munmap(queryFile.data, queryFile.fileSize + 1);
     if (par.seqMode == 2) {
         munmap(queryFile2.data, queryFile2.fileSize + 1);
@@ -319,57 +302,40 @@ void Classifier::startClassify(const LocalParameters &par) {
 
 void Classifier::fillQueryKmerBufferParallel(QueryKmerBuffer &kmerBuffer,
                                              MmapedData<char> &seqFile,
-                                             vector<Sequence> &seqs,
-                                             bool *checker,
-                                             size_t &processedSeqCnt,
-                                             Query *queryList,
+                                             const vector<Sequence> &seqs,
+                                             vector<Query> & queryList,
+                                             const pair<size_t, size_t> & currentSplit,
                                              const LocalParameters &par) {
-    bool hasOverflow = false;
-
 #ifdef OPENMP
     omp_set_num_threads(par.threads);
 #endif
 
-#pragma omp parallel default(none), shared(par, checker, hasOverflow, processedSeqCnt, kmerBuffer, seqFile, seqs, cout, queryList)
+#pragma omp parallel default(none), shared(par, kmerBuffer, seqFile, seqs, cout, queryList, currentSplit)
     {
         SeqIterator seqIterator(par);
         size_t posToWrite;
 #pragma omp for schedule(dynamic, 1)
-        for (size_t i = 0; i < seqs.size(); i++) {
-            if (!checker[i] && !hasOverflow) {
-                kseq_buffer_t buffer(const_cast<char *>(&seqFile.data[seqs[i].start]), seqs[i].length);
-                kseq_t *seq = kseq_init(&buffer);
-                kseq_read(seq);
-
-                auto kmerCnt = getQueryKmerNumber<size_t> (seq->seq.l);
-
-                // Ignore short read
-                if (kmerCnt < 1) {
-                    __sync_fetch_and_add(&processedSeqCnt, 1);
-                    checker[i] = true;
-                    continue;
-                }
-
-                posToWrite = kmerBuffer.reserveMemory(kmerCnt);
-                if (posToWrite + kmerCnt < kmerBuffer.bufferSize) {
-                    checker[i] = true;
-
-                    seqIterator.sixFrameTranslation(seq->seq.s);
-                    seqIterator.fillQueryKmerBuffer(seq->seq.s, (int)seq->seq.l, kmerBuffer, posToWrite,
-                                                    (int) i);
-
-                    queryList[i].queryLength = getMaxCoveredLength((int) seq->seq.l);
-                    queryList[i].queryId = (int) i;
-                    queryList[i].name = string(seq->name.s);
-                    queryList[i].kmerCnt = (int) kmerCnt;
-
-                    __sync_fetch_and_add(&processedSeqCnt, 1);
-                } else {
-                    __sync_fetch_and_sub(&(kmerBuffer.startIndexOfReserve), kmerCnt);
-                    hasOverflow = true;
-                }
-                kseq_destroy(seq);
+        for (size_t i = currentSplit.first; i < currentSplit.second; i++) {
+            size_t queryIdx = i - currentSplit.first;
+            kseq_buffer_t buffer(const_cast<char *>(&seqFile.data[seqs[i].start]), seqs[i].length);
+            kseq_t *seq = kseq_init(&buffer);
+            kseq_read(seq);
+            auto kmerCnt = getQueryKmerNumber<size_t> (seq->seq.l);
+            // Ignore short read
+            if (kmerCnt < 1) {
+                continue;
             }
+            posToWrite = kmerBuffer.reserveMemory(kmerCnt);
+
+            seqIterator.sixFrameTranslation(seq->seq.s);
+            seqIterator.fillQueryKmerBuffer(seq->seq.s, (int)seq->seq.l, kmerBuffer, posToWrite,
+                                            (int) queryIdx);
+
+            queryList[queryIdx].queryLength = getMaxCoveredLength((int) seq->seq.l);
+            queryList[queryIdx].queryId = (int) queryIdx;
+            queryList[queryIdx].name = string(seq->name.s);
+            queryList[queryIdx].kmerCnt = (int) kmerCnt;
+            kseq_destroy(seq);
         }
     }
 }
@@ -390,80 +356,131 @@ T Classifier::getQueryKmerNumber(T queryLength) {
     return (getMaxCoveredLength(queryLength) / 3 - kmerLength - spaceNum_int + 1) * 6;
 }
 
-void Classifier::   fillQueryKmerBufferParallel_paired(QueryKmerBuffer &kmerBuffer,
-                                                    MmapedData<char> &seqFile1,
-                                                    MmapedData<char> &seqFile2,
-                                                    vector<Sequence> &seqs,
-                                                    vector<Sequence> &seqs2,
-                                                    bool *checker,
-                                                    size_t &processedSeqCnt,
-                                                    Query *queryList,
-                                                    size_t numOfSeq,
-                                                    const LocalParameters &par) {
-    bool hasOverflow = false;
+void Classifier::fillQueryKmerBufferParallel(QueryKmerBuffer &kmerBuffer,
+                                             MmapedData<char> &seqFile1,
+                                             MmapedData<char> &seqFile2,
+                                             const vector<Sequence> &seqs,
+                                             const vector<Sequence> &seqs2,
+                                             vector<Query> & queryList,
+                                             const pair<size_t, size_t> & currentSplit,
+                                             const LocalParameters &par) {
+    vector<pair<size_t, size_t>> queryReadSplit;
+//    size_t numOfSeq = currentSplit.second - currentSplit.first;
+    size_t numOfSeqPerSplit = size_t(1000);
+    for (size_t i = currentSplit.first; i < currentSplit.second; i += numOfSeqPerSplit) {
+        queryReadSplit.emplace_back(i, std::min(i + numOfSeqPerSplit - 1, currentSplit.second- 1));
+    }
 
-#pragma omp parallel default(none), shared(par, checker, hasOverflow, processedSeqCnt, kmerBuffer, seqFile1, seqFile2, seqs, seqs2, cout, queryList, numOfSeq)
+#pragma omp parallel default(none), shared(par, kmerBuffer, seqFile1, seqFile2, seqs, seqs2, cout, queryList, currentSplit, queryReadSplit, numOfSeqPerSplit)
     {
+        FILE * query1 = fopen(par.filenames[0].c_str(), "r");
+        FILE * query2 = fopen(par.filenames[1].c_str(), "r");
+        char * readBuffer1 = (char *) malloc(3000 * numOfSeqPerSplit);
+        char * readBuffer2 = (char *) malloc(3000 * numOfSeqPerSplit);
+        size_t readBufferIdx1 = 0;
+        size_t readBufferIdx2 = 0;
         SeqIterator seqIterator(par);
         SeqIterator seqIterator2(par);
         size_t posToWrite;
+
 #pragma omp for schedule(dynamic, 1)
-        for (size_t i = 0; i < numOfSeq; i++) {
-            if (!checker[i] && !hasOverflow) {
-                // Read 1
-                kseq_buffer_t buffer(const_cast<char *>(&seqFile1.data[seqs[i].start]), seqs[i].length);
-                kseq_t *seq = kseq_init(&buffer);
-                kseq_read(seq);
-                auto kmerCnt = getQueryKmerNumber<size_t>(seq->seq.l);
+        for (size_t j = 0; j < queryReadSplit.size(); j ++) {
+            // Load query reads of current split
+            fseek(query1, (long) seqs[queryReadSplit[j].first].start, SEEK_SET);
+            loadBuffer(query1, readBuffer1, readBufferIdx1, seqs[queryReadSplit[j].second].end - seqs[queryReadSplit[j].first].start + 1);
+            fseek(query2, (long) seqs2[queryReadSplit[j].first].start, SEEK_SET);
+            loadBuffer(query2, readBuffer2, readBufferIdx2, seqs2[queryReadSplit[j].second].end - seqs2[queryReadSplit[j].first].start + 1);
+            for (size_t i = queryReadSplit[j].first; i <= queryReadSplit[j].second; i++) {
+                size_t queryIdx = i - currentSplit.first;
+                // Load Read 1
+                kseq_buffer_t buffer1(readBuffer1 + seqs[i].start - seqs[queryReadSplit[j].first].start,
+                                      seqs[i].length);
+                kseq_t *seq1 = kseq_init(&buffer1);
+                kseq_read(seq1);
+                auto kmerCnt = getQueryKmerNumber<size_t>(seq1->seq.l);
 
-                cout<< seq->name.s << endl;
-                cout << seq->seq.s << endl;
-
-
-                // Read 2
-                kseq_buffer_t buffer2(const_cast<char *>(&seqFile2.data[seqs2[i].start]), seqs2[i].length);
+                // Load Read 2
+                kseq_buffer_t buffer2(readBuffer2 + seqs2[i].start - seqs2[queryReadSplit[j].first].start,
+                                      seqs2[i].length);
                 kseq_t *seq2 = kseq_init(&buffer2);
                 kseq_read(seq2);
                 auto kmerCnt2 = getQueryKmerNumber<size_t>(seq2->seq.l);
 
-                cout<< seq2->name.s << endl;
-                cout << seq2->seq.s << endl;
-
                 // Ignore short read
                 if (kmerCnt2 < 1 || kmerCnt < 1) {
-                    __sync_fetch_and_add(&processedSeqCnt, 1);
-                    checker[i] = true;
                     continue;
                 }
 
                 posToWrite = kmerBuffer.reserveMemory(kmerCnt + kmerCnt2);
-                if (posToWrite + kmerCnt + kmerCnt2 < kmerBuffer.bufferSize) {
-                    checker[i] = true;
-                    // Read 1
-                    seqIterator.sixFrameTranslation(seq->seq.s);
-                    seqIterator.fillQueryKmerBuffer(seq->seq.s, (int)seq->seq.l, kmerBuffer, posToWrite, (int) i);
-                    queryList[i].queryLength = getMaxCoveredLength((int) seq->seq.l);
 
-                    // Read 2
-                    seqIterator2.sixFrameTranslation(seq2->seq.s);
-                    seqIterator2.fillQueryKmerBuffer(seq2->seq.s, (int)seq2->seq.l, kmerBuffer, posToWrite, (int) i,
-                                                     queryList[i].queryLength);
+                // Process Read 1
+                seqIterator.sixFrameTranslation(seq1->seq.s);
+                seqIterator.fillQueryKmerBuffer(seq1->seq.s, (int) seq1->seq.l, kmerBuffer, posToWrite,
+                                                (int) queryIdx);
+                queryList[queryIdx].queryLength = getMaxCoveredLength((int) seq1->seq.l);
 
-                    // Query Info
-                    queryList[i].queryLength2 = getMaxCoveredLength((int) seq2->seq.l);
-                    queryList[i].queryId = (int) i;
-                    queryList[i].name = string(seq->name.s);
-                    queryList[i].kmerCnt = (int) (kmerCnt + kmerCnt2);
+                // Process Read 2
+                seqIterator2.sixFrameTranslation(seq2->seq.s);
+                seqIterator2.fillQueryKmerBuffer(seq2->seq.s, (int) seq2->seq.l, kmerBuffer, posToWrite,
+                                                 (int) queryIdx, queryList[queryIdx].queryLength);
 
-                    __sync_fetch_and_add(&processedSeqCnt, 1);
-                } else {
-                    __sync_fetch_and_sub(&(kmerBuffer.startIndexOfReserve), kmerCnt + kmerCnt2);
-                    hasOverflow = true;
-                }
-                kseq_destroy(seq);
+                // Query Info
+                queryList[queryIdx].queryLength2 = getMaxCoveredLength((int) seq2->seq.l);
+                queryList[queryIdx].queryId = (int) queryIdx;
+                queryList[queryIdx].name = string(seq1->name.s);
+                queryList[queryIdx].kmerCnt = (int) (kmerCnt + kmerCnt2);
+
+                kseq_destroy(seq1);
                 kseq_destroy(seq2);
             }
         }
+//        for (size_t i = currentSplit.first; i < currentSplit.second; i++) {
+//            size_t queryIdx = i - currentSplit.first;
+//
+//            // Read 1
+//            fseek(query1, (long) seqs[i].start, SEEK_SET);
+//            loadBuffer(query1, readBuffer1, readBufferIdx1, seqs[i].length);
+//            kseq_buffer_t buffer(readBuffer1, seqs[i].length);
+//            kseq_t *seq = kseq_init(&buffer);
+//            kseq_read(seq);
+//            auto kmerCnt = getQueryKmerNumber<size_t>(seq->seq.l);
+//
+//            // Read 2
+//            fseek(query2, (long) seqs2[i].start, SEEK_SET);
+//            loadBuffer(query2, readBuffer2, readBufferIdx2, seqs2[i].length);
+//            kseq_buffer_t buffer2(readBuffer2, seqs2[i].length);
+//            kseq_t *seq2 = kseq_init(&buffer2);
+//            kseq_read(seq2);
+//            auto kmerCnt2 = getQueryKmerNumber<size_t>(seq2->seq.l);
+//
+//
+//
+//            posToWrite = kmerBuffer.reserveMemory(kmerCnt + kmerCnt2);
+//
+//            // Read 1
+//            seqIterator.sixFrameTranslation(seq->seq.s);
+//            seqIterator.fillQueryKmerBuffer(seq->seq.s, (int) seq->seq.l, kmerBuffer, posToWrite,
+//                                            (int) queryIdx);
+//            queryList[queryIdx].queryLength = getMaxCoveredLength((int) seq->seq.l);
+//
+//            // Read 2
+//            seqIterator2.sixFrameTranslation(seq2->seq.s);
+//            seqIterator2.fillQueryKmerBuffer(seq2->seq.s, (int) seq2->seq.l, kmerBuffer, posToWrite,
+//                                             (int) queryIdx);
+//
+//            // Query Info
+//            queryList[queryIdx].queryLength2 = getMaxCoveredLength((int) seq2->seq.l);
+//            queryList[queryIdx].queryId = (int) queryIdx;
+//            queryList[queryIdx].name = string(seq->name.s);
+//            queryList[queryIdx].kmerCnt = (int) (kmerCnt + kmerCnt2);
+//
+//            kseq_destroy(seq);
+//            kseq_destroy(seq2);
+//        }
+        free(readBuffer1);
+        free(readBuffer2);
+        fclose(query1);
+        fclose(query2);
     }
 }
 
@@ -566,8 +583,8 @@ querySplits, queryKmerList, matchBuffer, cout, par, targetDiffIdxFileName, numOf
             FILE * kmerInfoFp = fopen(targetInfoFileName.c_str(), "rb");
 
             // Target K-mer buffer
-            uint16_t * diffIdxBuffer = (uint16_t *) malloc(sizeof(uint16_t) * (BufferSize + 1));
-            TargetKmerInfo * kmerInfoBuffer = (TargetKmerInfo *) malloc(sizeof(TargetKmerInfo) * (BufferSize+1));
+            uint16_t * diffIdxBuffer = (uint16_t *) malloc(sizeof(uint16_t) * (BufferSize + 1)); // size = 32 Mb
+            TargetKmerInfo * kmerInfoBuffer = (TargetKmerInfo *) malloc(sizeof(TargetKmerInfo) * (BufferSize+1)); // 64 Mb
             size_t kmerInfoBufferIdx = 0;
             size_t diffIdxBufferIdx = 0;
 
@@ -583,11 +600,11 @@ querySplits, queryKmerList, matchBuffer, cout, par, targetDiffIdxFileName, numOf
 
             //Match buffer for each thread
             int localBufferSize = 2'000'000; // 32 Mb
-            auto *matches = new Match[localBufferSize];
+            auto *matches = new Match[localBufferSize]; // 16 * 2'000'000 = 32 Mb
             int matchCnt = 0;
 
-            // For debug
-            SeqIterator seqIterator(par);
+//            // For debug
+//            SeqIterator seqIterator(par);
 
             //vectors for selected target k-mers
             vector<uint8_t> selectedHammingSum;
@@ -702,7 +719,7 @@ querySplits, queryKmerList, matchBuffer, cout, par, targetDiffIdxFileName, numOf
 
                     // Skip target k-mers that are not matched in amino acid level
                     while (diffIdxPos != numOfDiffIdx
-                        && (AminoAcidPart(currentQuery) > AminoAcidPart(currentTargetKmer))) {
+                           && (AminoAcidPart(currentQuery) > AminoAcidPart(currentTargetKmer))) {
                         if (unlikely(BufferSize < diffIdxBufferIdx + 7)){
                             loadBuffer(diffIdxFp, diffIdxBuffer, diffIdxBufferIdx, BufferSize, ((int)(BufferSize - diffIdxBufferIdx)) * -1 );
                         }
@@ -716,9 +733,9 @@ querySplits, queryKmerList, matchBuffer, cout, par, targetDiffIdxFileName, numOf
                         continue;
                     else
 
-                    // Load target k-mers that are matched in amino acid level
-                    while (diffIdxPos != numOfDiffIdx &&
-                        AminoAcidPart(currentQuery) == AminoAcidPart(currentTargetKmer)) {
+                        // Load target k-mers that are matched in amino acid level
+                        while (diffIdxPos != numOfDiffIdx &&
+                               AminoAcidPart(currentQuery) == AminoAcidPart(currentTargetKmer)) {
 //                        // Print the target k-mer
 //                        cout << queryKmerList[j].info.sequenceID << "\t" << queryKmerList[j].info.pos << "\t" << (int) queryKmerList[j].info.frame << endl;
 //                        cout << "Query  k-mer: " ;
@@ -728,18 +745,18 @@ querySplits, queryKmerList, matchBuffer, cout, par, targetDiffIdxFileName, numOf
 //                        print_binary64(64, currentTargetKmer); cout << "\t";
 //                        seqIterator.printKmerInDNAsequence(currentTargetKmer); cout << "\t" << taxIdList[kmerInfoBuffer[kmerInfoBufferIdx].sequenceID] << endl;
 //                        cout << (int) getHammingDistanceSum(currentQuery, currentTargetKmer) << endl;
-                        candidateTargetKmers.push_back(currentTargetKmer);
-                        candidateKmerInfos.push_back(getKmerInfo(BufferSize, kmerInfoFp, kmerInfoBuffer, kmerInfoBufferIdx));
+                            candidateTargetKmers.push_back(currentTargetKmer);
+                            candidateKmerInfos.push_back(getKmerInfo(BufferSize, kmerInfoFp, kmerInfoBuffer, kmerInfoBufferIdx));
 
-                        if (unlikely(BufferSize < diffIdxBufferIdx + 7)){
-                            loadBuffer(diffIdxFp, diffIdxBuffer, diffIdxBufferIdx,
-                                       BufferSize, ((int)(BufferSize - diffIdxBufferIdx)) * -1 );
+                            if (unlikely(BufferSize < diffIdxBufferIdx + 7)){
+                                loadBuffer(diffIdxFp, diffIdxBuffer, diffIdxBufferIdx,
+                                           BufferSize, ((int)(BufferSize - diffIdxBufferIdx)) * -1 );
+                            }
+
+                            currentTargetKmer = getNextTargetKmer(currentTargetKmer, diffIdxBuffer,
+                                                                  diffIdxBufferIdx, diffIdxPos, BufferSize, diffIdxFp);
+                            kmerInfoBufferIdx ++;
                         }
-
-                        currentTargetKmer = getNextTargetKmer(currentTargetKmer, diffIdxBuffer,
-                                                              diffIdxBufferIdx, diffIdxPos, BufferSize, diffIdxFp);
-                        kmerInfoBufferIdx ++;
-                    }
 
                     // Compare the current query and the loaded target k-mers and select
                     compareDna(currentQuery, candidateTargetKmers, selectedMatches, selectedHammingSum, selectedHammings);
@@ -849,12 +866,12 @@ void Classifier::compareDna(uint64_t query, vector<uint64_t> &targetKmersToCompa
 // It analyses the result of linear search.
 void Classifier::fromMatchToClassification(Match *matchList,
                                            size_t numOfMatches,
-                                           int seqNum,
-                                           Query *queryList,
+                                           vector<Query> & queryList,
                                            const LocalParameters &par) {
 
     // Devide matches into blocks for multi threading
-    cout << "Devide matches into blocks for multi threading" << endl;
+//    cout << "Devide matches into blocks for multi threading" << endl;
+    size_t seqNum = queryList.size();
     MatchBlock *matchBlocks = new MatchBlock[seqNum];
     size_t matchIdx = 0;
     size_t blockIdx = 0;
@@ -889,7 +906,6 @@ void Classifier::fromMatchToClassification(Match *matchList,
         }
     }
 
-
     for (size_t i = 0; i < blockIdx; i++) {
         ++taxCounts[queryList[matchBlocks[i].id].classification];
     }
@@ -899,15 +915,17 @@ void Classifier::fromMatchToClassification(Match *matchList,
 
 
 void Classifier::chooseBestTaxon(uint32_t currentQuery,
-                                 size_t offset, size_t end, Match *matchList, Query *queryList,
+                                 size_t offset,
+                                 size_t end,
+                                 Match *matchList,
+                                 vector<Query> & queryList,
                                  const LocalParameters &par) {
-//    int queryLength = queryList[currentQuery].queryLength;
     TaxID selectedTaxon;
     if (par.printLog) {
         cout << "# " << currentQuery << " " << queryList[currentQuery].name << endl;
         for (size_t i = offset; i < end + 1; i++) {
             cout << genusTaxIdList[matchList[i].targetId] << " " << speciesTaxIdList[matchList[i].targetId] << " " <<
-            taxIdList[matchList[i].targetId] << " " << matchList[i].position << " " << int(matchList[i].hamming) << endl;
+                 taxIdList[matchList[i].targetId] << " " << matchList[i].position << " " << int(matchList[i].hamming) << endl;
         }
     }
 
@@ -928,7 +946,7 @@ void Classifier::chooseBestTaxon(uint32_t currentQuery,
                                               queryList[currentQuery].queryLength2);
         }
     } else {
-        if (par.spaceMask != "11111111"){
+        if (par.spaceMask != "11111111") {
             genusScore = getBestGenusMatches_spaced(genusMatches, matchList, end, offset,
                                                     queryList[currentQuery].queryLength);
         } else {
@@ -936,6 +954,7 @@ void Classifier::chooseBestTaxon(uint32_t currentQuery,
                                               queryList[currentQuery].queryLength);
         }
     }
+
 
     if (par.printLog) {
         cout << "# " << currentQuery << " " << queryList[currentQuery].name << " filtered\n";
@@ -1076,7 +1095,7 @@ void Classifier::chooseBestTaxon(uint32_t currentQuery,
         cout << "# " << currentQuery << endl;
         for (size_t i = 0; i < genusMatches.size(); i++) {
             cout << i << " " << genusMatches[i].position << " " <<
-            taxIdList[genusMatches[i].targetId] << " " << int(genusMatches[i].hamming) << endl;
+                 taxIdList[genusMatches[i].targetId] << " " << int(genusMatches[i].hamming) << endl;
         }
         cout << "Score: " << speciesScore.score << "  " << selectedSpecies << " "
              << taxonomy->taxonNode(selectedSpecies)->rank
@@ -1197,11 +1216,14 @@ TaxonScore Classifier::getBestGenusMatches3(vector<Match> &genusMatches, Match *
                             matchesForEachGenus[g].end());
     }
 
+
+
     // More than one genus
     if (maxIdx.size() > 1) {
         bestScore.taxId = 0;
         return bestScore;
     }
+
     return bestScore;
 
     //Three cases
@@ -1645,7 +1667,7 @@ TaxonScore Classifier::scoreGenus(vector<Match> &filteredMatches,
 //             " " << matches.size()
 //             << endl;
 //    }
-    matchesForEachGenus.push_back(move(matches));
+    matchesForEachGenus.push_back(std::move(matches));
     return {genusTaxIdList[filteredMatches[0].targetId], score, coverage, (int) hammingSum};
 }
 
@@ -1665,12 +1687,12 @@ TaxonScore Classifier::scoreGenus(vector<Match> &filteredMatches,
         // Look through overlaps within a species
         while (walker < numOfFitMat && speciesTaxIdList[filteredMatches[walker].targetId] == currentSpecies
                && filteredMatches[walker].position / 3 == currentPosition
-               ) {
+                ) {
             // Take the match with lower hamming distance
             if (filteredMatches[walker].hamming < currentMatch.hamming) {
                 currentMatch = filteredMatches[walker];
             }
-            // Overlapping with same hamming distance but different subspecies taxonomy ID -> species level
+                // Overlapping with same hamming distance but different subspecies taxonomy ID -> species level
             else if (taxIdList[currentMatch.targetId] != taxIdList[filteredMatches[walker].targetId] &&
                      currentMatch.hamming == filteredMatches[walker].hamming) {
                 currentMatch.redundancy = true;
@@ -1727,7 +1749,7 @@ TaxonScore Classifier::scoreGenus(vector<Match> &filteredMatches,
                 coveredPosCnt_read1++;
             }
         }
-        // Read 2
+            // Read 2
         else {
             if (hammingsAtEachPos[h] == 0) { // Add 0 for 0 hamming dist.
                 coveredPosCnt_read2++;
@@ -1936,7 +1958,7 @@ TaxonScore Classifier::scoreTaxon(const vector<Match> &matches,
                 coveredPosCnt_read1++;
             }
         }
-        // Read 2
+            // Read 2
         else {
             if (hammingsAtEachPos[h] == 0) { // Add 0 for 0 hamming dist.
                 coveredPosCnt_read2++;
@@ -1961,7 +1983,7 @@ TaxonScore Classifier::scoreTaxon(const vector<Match> &matches,
     return {0, score, coverage, hammingDist};
 }
 
-void Classifier::writeReadClassification(Query *queryList, int queryNum, ofstream &readClassificationFile) {
+void Classifier::writeReadClassification(const vector<Query> & queryList, int queryNum, ofstream &readClassificationFile) {
     for (int i = 0; i < queryNum; i++) {
         readClassificationFile << queryList[i].isClassified << "\t" << queryList[i].name << "\t"
                                << queryList[i].classification << "\t"
@@ -2068,15 +2090,15 @@ void Classifier::splitFASTA(vector<Sequence> & seqSegments, const string & query
     string line;
     size_t start = 0;
     size_t end;
-    size_t seqLength = 0;
     getline(fasta, line);
+    size_t seqLength = 0;
     while (getline(fasta, line)) {
         if (line[0] == '>') {
-            end = (size_t) fasta.tellg() - line.length() - 2;
             seqSegments.emplace_back(start, end, end - start + 1, seqLength);
             start = end + 1;
             seqLength = 0;
         } else {
+            end = (size_t) fasta.tellg() - 1;
             seqLength += line.length();
         }
     }
