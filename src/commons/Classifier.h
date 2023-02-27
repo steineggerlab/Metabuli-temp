@@ -23,7 +23,7 @@
 #include <set>
 #include <cmath>
 #include "Match.h"
-
+#include "Query.h"
 
 #define BufferSize 16'777'216 //16 * 1024 * 1024 // 16 MB
 using namespace std;
@@ -86,32 +86,6 @@ protected:
         DiffIdxSplit diffIdxSplit; // index in target k-mer list from where the search begins.
     };
 
-
-    template<typename T>
-    struct Buffer {
-        T *buffer;
-        size_t startIndexOfReserve;
-        size_t bufferSize;
-
-        explicit Buffer(size_t sizeOfBuffer=100) {
-            buffer = (T *) malloc(sizeof(T) * sizeOfBuffer);
-            bufferSize = sizeOfBuffer;
-            startIndexOfReserve = 0;
-        };
-
-        size_t reserveMemory(size_t numOfKmer) {
-            size_t offsetToWrite = __sync_fetch_and_add(&startIndexOfReserve, numOfKmer);
-            return offsetToWrite;
-        };
-
-        void reallocateMemory(size_t sizeOfBuffer) {
-            if (sizeOfBuffer > bufferSize) {
-                buffer = (T *) realloc(buffer, sizeof(T) * sizeOfBuffer);
-                bufferSize = sizeOfBuffer;
-            }
-        };
-    };
-
     int numOfSplit;
     unordered_map<TaxID, unsigned int> taxCounts;
     uint64_t MARKER;
@@ -139,24 +113,33 @@ protected:
                                      const LocalParameters &par);
 
     void fillQueryKmerBufferParallel(QueryKmerBuffer &kmerBuffer,
-                                     MmapedData<char> &seqFile1,
-                                     MmapedData<char> &seqFile2,
                                      const vector<Sequence> &seqs,
                                      const vector<Sequence> &seqs2,
                                      vector<Query> & queryList,
                                      const pair<size_t, size_t> & currentSplit,
                                      const LocalParameters &par);
 
+    void fillQueryKmerBuffer(QueryKmerBuffer &kmerBuffer,
+                             const vector<Sequence> &seqs,
+                             const vector<Sequence> &seqs2,
+                             vector<Query> &queryList,
+                             const pair<size_t, size_t> &currentSplit,
+                             const LocalParameters &par);
+
     static int getMaxCoveredLength(int queryLength);
 
     template<typename T>
     T getQueryKmerNumber(T queryLength);
 
-    void linearSearchParallel(
-            QueryKmer *queryKmerList,
-            size_t &queryKmerCnt,
-            Buffer<Match> &matchBuffer,
-            const LocalParameters &par);
+    void linearSearchParallel(QueryKmer *queryKmerList,
+                              size_t &queryKmerCnt,
+                              vector<Query> &queryList,
+                              const LocalParameters &par);
+
+    void linearSearch(QueryKmer *queryKmerList,
+                      size_t &queryKmerCnt,
+                      vector<Query> &queryList,
+                      const LocalParameters &par);
 
     void compareDna(uint64_t query, vector<uint64_t> &targetKmersToCompare, vector<size_t> &selectedMatches,
                     vector<uint8_t> &selectedHammingSum, vector<uint16_t> &rightEndHammings);
@@ -180,17 +163,11 @@ protected:
                          vector<Query> & queryList,
                          const LocalParameters &par);
 
-//    TaxonScore getBestGenusMatches(vector<Match> &matchesForMajorityLCA, Match *matchList, size_t end,
-//                                   size_t offset, int queryLength);
+    TaxonScore getBestGenusMatches(vector<Match> &matchesForMajorityLCA, Match *matchList, size_t end,
+                                   size_t offset, int queryLength);
 
-    TaxonScore getBestGenusMatches3(vector<Match> &matchesForMajorityLCA, Match *matchList, size_t end,
-                                    size_t offset, int queryLength);
-//
-//    TaxonScore getBestGenusMatches(vector<Match> &matchesForMajorityLCA, Match *matchList, size_t end, size_t offset,
-//                                   int readLength1, int readLength2);
-
-    TaxonScore getBestGenusMatches3(vector<Match> &matchesForMajorityLCA, Match *matchList, size_t end, size_t offset,
-                                    int readLength1, int readLength2);
+    TaxonScore getBestGenusMatches(vector<Match> &matchesForMajorityLCA, Match *matchList, size_t end, size_t offset,
+                                   int readLength1, int readLength2);
 
     TaxonScore getBestGenusMatches_spaced(vector<Match> &matchesForMajorityLCA, Match *matchList, size_t end, size_t offset,
                                           int readLength1, int readLength2);
@@ -205,11 +182,6 @@ protected:
                           vector<vector<Match>> &matchesForEachGenus,
                           int readLength1,
                           int readLength2);
-
-    void scoreGenus_ExtensionScore(vector<Match> &filteredMatches,
-                                   vector<vector<Match>> &matchesForEachGenus,
-                                   vector<float> &scoreOfEachGenus,
-                                   int readLength1, int readLength2);
 
     TaxonScore chooseSpecies(const std::vector<Match> &matches,
                        int queryLength,
@@ -278,8 +250,8 @@ public:
 
     static uint64_t getNextTargetKmer(uint64_t lookingTarget, const uint16_t *targetDiffIdxList, size_t &diffIdxPos);
 
-    static uint64_t getNextTargetKmer(uint64_t lookingTarget, uint16_t *targetDiffIdxList, size_t & diffIdxPos,
-                                      size_t & totalPos, size_t bufferSize, FILE * diffIdxFp);
+    static uint64_t getNextTargetKmer(uint64_t lookingTarget, const uint16_t *targetDiffIdxList, size_t & diffIdxPos,
+                                      size_t & totalPos);
 
     static TargetKmerInfo getKmerInfo(size_t bufferSize, FILE * kmerInfoFp, TargetKmerInfo * infoBuffer,
                               size_t & infoBufferIdx);
@@ -291,29 +263,29 @@ public:
 
 };
 
-struct sortMatch {
-    sortMatch(const Classifier * classifier) : classifier(classifier) {}
-    bool operator() (const Match & a, const Match & b) const {
-        if (a.queryId < b.queryId) return true;
-        else if (a.queryId == b.queryId) {
-            if (classifier->genusTaxIdList[a.targetId] < classifier->genusTaxIdList[b.targetId]) return true;
-            else if (classifier->genusTaxIdList[a.targetId] == classifier->genusTaxIdList[b.targetId]) {
-                if (classifier->speciesTaxIdList[a.targetId] < classifier->speciesTaxIdList[b.targetId]) return true;
-                else if (classifier->speciesTaxIdList[a.targetId] == classifier->speciesTaxIdList[b.targetId]) {
-                    if (a.position < b.position) return true;
-                    else if (a.position == b.position) {
-                        if (a.hamming < b.hamming) return true;
-                        else if (a.hamming == b.hamming){
-                            return classifier->taxIdList[a.targetId] < classifier->taxIdList[b.targetId];
-                        }
-                    }
-                }
-            }
-        }
-        return false;
-    }
-    const Classifier *  classifier;
-};
+//struct sortMatch {
+//    sortMatch(const Classifier * classifier) : classifier(classifier) {}
+//    bool operator() (const Match & a, const Match & b) const {
+//        if (a.queryId < b.queryId) return true;
+//        else if (a.queryId == b.queryId) {
+//            if (classifier->genusTaxIdList[a.targetId] < classifier->genusTaxIdList[b.targetId]) return true;
+//            else if (classifier->genusTaxIdList[a.targetId] == classifier->genusTaxIdList[b.targetId]) {
+//                if (classifier->speciesTaxIdList[a.targetId] < classifier->speciesTaxIdList[b.targetId]) return true;
+//                else if (classifier->speciesTaxIdList[a.targetId] == classifier->speciesTaxIdList[b.targetId]) {
+//                    if (a.position < b.position) return true;
+//                    else if (a.position == b.position) {
+//                        if (a.hamming < b.hamming) return true;
+//                        else if (a.hamming == b.hamming){
+//                            return classifier->taxIdList[a.targetId] < classifier->taxIdList[b.targetId];
+//                        }
+//                    }
+//                }
+//            }
+//        }
+//        return false;
+//    }
+//    const Classifier *  classifier;
+//};
 
 inline uint8_t Classifier::getHammingDistanceSum(uint64_t kmer1, uint64_t kmer2) {//12345678
     uint8_t hammingSum = 0;
@@ -358,8 +330,7 @@ Classifier::getNextTargetKmer(uint64_t lookingTarget, const uint16_t *targetDiff
 }
 
 inline uint64_t
-Classifier::getNextTargetKmer(uint64_t lookingTarget, uint16_t * diffIdxBuffer, size_t & diffBufferIdx, size_t & totalPos,
-                              size_t bufferSize, FILE * diffIdxFp) {
+Classifier::getNextTargetKmer(uint64_t lookingTarget, const uint16_t * diffIdxBuffer, size_t & diffBufferIdx, size_t & totalPos) {
     uint16_t fragment;
     uint16_t check = 32768; // 2^15
     uint64_t diffIn64bit = 0;
