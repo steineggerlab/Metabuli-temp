@@ -261,6 +261,9 @@ public:
     virtual ~Classifier();
 
 
+    void
+    loadAndDecompressDatabase(Buffer<size_t> &kmerBuffer, Buffer<TargetKmerInfo> &infoBuffer,
+                              const LocalParameters &par);
 };
 
 //struct sortMatch {

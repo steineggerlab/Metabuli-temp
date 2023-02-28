@@ -214,6 +214,25 @@ void Classifier::startClassify(const LocalParameters &par) {
 #endif
     // Extract k-mers from query sequences and compare them to target k-mer DB
     double vm, rss;
+
+    // Target K-mer Buffer
+    Buffer<size_t> targetKmerBuffer;
+    Buffer<TargetKmerInfo> targetKmerInfoBuffer;
+
+    // Load database split index
+    string diffIdxSplitFileName = dbDir + "/split";
+    struct MmapedData<DiffIdxSplit> diffIdxSplits = mmapData<DiffIdxSplit>(diffIdxSplitFileName.c_str());
+
+    // Filter out meaningless target splits
+    size_t numOfDiffIdxSplits = diffIdxSplits.fileSize / sizeof(DiffIdxSplit);
+    size_t numOfDiffIdxSplits_use = numOfDiffIdxSplits;
+    for (size_t i = 1; i < numOfDiffIdxSplits; i++) {
+        if (diffIdxSplits.data[i].ADkmer == 0 || diffIdxSplits.data[i].ADkmer == UINT64_MAX) {
+            diffIdxSplits.data[i] = {UINT64_MAX, UINT64_MAX, UINT64_MAX};
+            numOfDiffIdxSplits_use--;
+        }
+    }
+
     for (size_t splitIdx = 0; splitIdx < queryReadSplit.size(); splitIdx++) {
         // Split current split into multiple chunks by number of threads
         vector<pair<size_t, size_t>> queryReadSplitChunk;
@@ -227,6 +246,7 @@ void Classifier::startClassify(const LocalParameters &par) {
         {
             vector<Query> queryList;
             QueryKmerBuffer kmerBuffer;
+            size_t queryKmerIdx = 0;
 
 #pragma omp for schedule(dynamic, 1) nowait
             for (size_t chunkIdx = 0; chunkIdx < queryReadSplitChunk.size(); chunkIdx++) {
@@ -258,15 +278,15 @@ void Classifier::startClassify(const LocalParameters &par) {
 
                 // Sort query k-mer
                 sort(kmerBuffer.buffer, kmerBuffer.buffer + kmerBuffer.startIndexOfReserve, compareForLinearSearch);
-
-                // Compare query k-mers to target k-mer DB
-                linearSearch(kmerBuffer.buffer, kmerBuffer.startIndexOfReserve, queryList, par);
-
-//                // Classifications
-//                for (auto &query: queryList) {
-//                    query.classify();
-//                }
             }
+            // Compare query k-mers to target k-mer DB
+            while (end of current split){
+                load and unpack database
+
+                linear search
+            }
+
+
 #pragma omp critical
             {
                 // Write classification results
@@ -293,6 +313,14 @@ void Classifier::startClassify(const LocalParameters &par) {
     if (par.seqMode == 2) {
         munmap(queryFile2.data, queryFile2.fileSize + 1);
     }
+}
+
+void Classifier::loadAndDecompressDatabase(Buffer<size_t> & kmerBuffer,
+                                           Buffer<TargetKmerInfo> & infoBuffer,
+                                           const LocalParameters & par){
+
+
+
 }
 
 void Classifier::fillQueryKmerBufferParallel(QueryKmerBuffer &kmerBuffer,
